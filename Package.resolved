@@ -67,7 +67,7 @@
     {
       "identity" : "psql",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/leviouwendijk/PSQL.git",
+      "location" : "https://github.com/swift-dsl/PSQL.git",
       "state" : {
         "branch" : "master",
         "revision" : "d38ced567e93a5c616836e6dadba5206ad182caa"
