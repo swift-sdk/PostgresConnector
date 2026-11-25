@@ -18,7 +18,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.29.0"),
         .package(url: "https://github.com/vapor/postgres-kit.git", from: "2.11.4"),
-        .package(url: "https://github.com/leviouwendijk/Milieu.git", branch: "master"),
+        .package(url: "https://github.com/swift-lco/Milieu.git", branch: "master"),
         .package(url: "https://github.com/swift-dsl/PSQL.git", branch: "master"),
     ],
     targets: [
