@@ -1,6 +1,6 @@
 import Foundation
 import NIOCore
-import PostgresKit
+import PostgresNIO
 import PSQL
 
 public enum PostgresTransactionIsolation:
@@ -112,14 +112,17 @@ public enum PostgresTransactionError:
 
 public actor PostgresTransaction {
     private let connection: PostgresConnection
+    private let database: String
 
     private var isOpen = true
     private var operationInFlight = false
 
     internal init(
-        connection: PostgresConnection
+        connection: PostgresConnection,
+        database: String
     ) {
         self.connection = connection
+        self.database = database
     }
 
     public func rows(
@@ -128,13 +131,15 @@ public actor PostgresTransaction {
         try beginOperation()
 
         do {
-            let rows = try await connection
-                .query(
-                    query.sql,
-                    query.binds
-                )
-                .map(\.rows)
-                .get()
+            let rows = try await PostgresConnector.reporting(database) {
+                try await connection
+                    .query(
+                        query.sql,
+                        query.binds
+                    )
+                    .map(\.rows)
+                    .get()
+            }
 
             finishOperation()
 
@@ -174,12 +179,14 @@ public actor PostgresTransaction {
         try beginOperation()
 
         do {
-            _ = try await connection
-                .query(
-                    query.sql,
-                    query.binds
-                )
-                .get()
+            _ = try await PostgresConnector.reporting(database) {
+                try await connection
+                    .query(
+                        query.sql,
+                        query.binds
+                    )
+                    .get()
+            }
 
             finishOperation()
         } catch {

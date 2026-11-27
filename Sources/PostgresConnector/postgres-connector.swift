@@ -1,34 +1,50 @@
 import Foundation
+import Loggers
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
-import PostgresKit
+import PostgresNIO
 import PSQL
 
+/// One `PostgresClient` pool per declared database. Idle connections run a
+/// keepalive query and are closed after the idle timeout (`PostgresPoolOptions`),
+/// so a connection a firewall has silently dropped is found by the pool rather
+/// than handed to a query.
 public actor PostgresConnector {
     private let eventLoopGroup: any EventLoopGroup
     private let ownsEventLoopGroup: Bool
-    private let pools: [PostgresDatabaseIdentifier: EventLoopGroupConnectionPool<PostgresConnectionSource>]
+    private let clients: [PostgresDatabaseIdentifier: PostgresClient]
     private let states: [PostgresDatabaseState]
+    private let options: PostgresPoolOptions
+    private let runTask: Task<Void, Never>
 
     /// Every database is required: any configuration failure throws, as before.
     public init(
         databases: [PostgresDatabase],
-        eventLoopGroup: any EventLoopGroup
+        eventLoopGroup: any EventLoopGroup,
+        pool options: PostgresPoolOptions = .init(),
+        logger: StandardLogger? = nil
     ) throws {
         try self.init(
             declarations: databases.map { PostgresDatabaseDeclaration($0) },
-            eventLoopGroup: eventLoopGroup
+            eventLoopGroup: eventLoopGroup,
+            pool: options,
+            logger: logger
         )
     }
 
     /// Every database is required: any configuration failure throws, as before.
     public init(
         databases: [PostgresDatabase],
-        threadCount: Int = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        threadCount: Int = max(1, ProcessInfo.processInfo.activeProcessorCount),
+        pool options: PostgresPoolOptions = .init(),
+        logger: StandardLogger? = nil
     ) throws {
         try self.init(
             declarations: databases.map { PostgresDatabaseDeclaration($0) },
-            threadCount: threadCount
+            threadCount: threadCount,
+            pool: options,
+            logger: logger
         )
     }
 
@@ -37,16 +53,22 @@ public actor PostgresConnector {
     /// only when a required one fails (or an id is declared twice).
     public init(
         declarations: [PostgresDatabaseDeclaration],
-        eventLoopGroup: any EventLoopGroup
+        eventLoopGroup: any EventLoopGroup,
+        pool options: PostgresPoolOptions = .init(),
+        logger: StandardLogger? = nil
     ) throws {
         let built = try Self.build(
             declarations: declarations,
-            eventLoopGroup: eventLoopGroup
+            eventLoopGroup: eventLoopGroup,
+            options: options,
+            logger: logger
         )
         self.eventLoopGroup = eventLoopGroup
         self.ownsEventLoopGroup = false
-        self.pools = built.pools
+        self.clients = built.clients
         self.states = built.states
+        self.options = options
+        self.runTask = Self.start(built.clients)
     }
 
     /// Configures each declaration independently. Optional databases that
@@ -54,19 +76,25 @@ public actor PostgresConnector {
     /// only when a required one fails (or an id is declared twice).
     public init(
         declarations: [PostgresDatabaseDeclaration],
-        threadCount: Int = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        threadCount: Int = max(1, ProcessInfo.processInfo.activeProcessorCount),
+        pool options: PostgresPoolOptions = .init(),
+        logger: StandardLogger? = nil
     ) throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: threadCount)
 
         do {
             let built = try Self.build(
                 declarations: declarations,
-                eventLoopGroup: group
+                eventLoopGroup: group,
+                options: options,
+                logger: logger
             )
             self.eventLoopGroup = group
             self.ownsEventLoopGroup = true
-            self.pools = built.pools
+            self.clients = built.clients
             self.states = built.states
+            self.options = options
+            self.runTask = Self.start(built.clients)
         } catch {
             try? group.syncShutdownGracefully()
             throw error
@@ -77,13 +105,11 @@ public actor PostgresConnector {
         for query: PostgresPreparedQuery,
         on database: PostgresDatabaseIdentifier
     ) async throws -> [PostgresRow] {
-        let pool = try self.pool(for: database)
+        let id = database.rawValue
 
-        return try await withCheckedThrowingContinuation { continuation in
-            pool.withConnection { connection in
-                connection.query(query.sql, query.binds).map(\.rows)
-            }.whenComplete { result in
-                continuation.resume(with: result)
+        return try await withConnection(on: database) { connection in
+            try await Self.reporting(id) {
+                try await connection.query(query.sql, query.binds).get().rows
             }
         }
     }
@@ -113,18 +139,11 @@ public actor PostgresConnector {
         _ query: PostgresPreparedQuery,
         on database: PostgresDatabaseIdentifier
     ) async throws {
-        let pool = try self.pool(for: database)
+        let id = database.rawValue
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            pool.withConnection { connection in
-                connection.query(query.sql, query.binds)
-            }.whenComplete { result in
-                switch result {
-                case .success:
-                    continuation.resume(returning: ())
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
+        try await withConnection(on: database) { connection in
+            try await Self.reporting(id) {
+                _ = try await connection.query(query.sql, query.binds).get()
             }
         }
     }
@@ -157,69 +176,60 @@ public actor PostgresConnector {
             PostgresTransaction
         ) async throws -> Result
     ) async throws -> Result {
-        let pool = try self.pool(
-            for: database
-        )
+        let id = database.rawValue
 
-        return try await pool
-            .withConnection { connection in
-                connection.eventLoop.makeFutureWithTask {
-                    let transaction = PostgresTransaction(
-                        connection: connection
-                    )
+        return try await withConnection(on: database) { connection in
+            let transaction = PostgresTransaction(
+                connection: connection,
+                database: id
+            )
 
-                    do {
-                        try Task.checkCancellation()
+            do {
+                try Task.checkCancellation()
 
-                        try await transaction.begin(
-                            options: options
-                        )
-                    } catch {
-                        await transaction.close()
+                try await transaction.begin(
+                    options: options
+                )
+            } catch {
+                await transaction.close()
 
-                        throw error
-                    }
-
-                    do {
-                        let result = try await operation(
-                            transaction
-                        )
-
-                        try Task.checkCancellation()
-
-                        try await transaction.commit()
-
-                        await transaction.close()
-
-                        return result
-                    } catch {
-                        let operationError = error
-
-                        do {
-                            try await transaction.rollback()
-                        } catch {
-                            let rollbackError = error
-
-                            await transaction.close()
-
-                            throw PostgresTransactionError
-                                .rollbackFailed(
-                                    operation: String(
-                                        describing: operationError
-                                    ),
-                                    rollback: String(
-                                        describing: rollbackError
-                                    )
-                                )
-                        }
-
-                        await transaction.close()
-
-                        throw operationError
-                    }
-                }
+                throw error
             }
-            .get()
+
+            do {
+                let result = try await operation(
+                    transaction
+                )
+
+                try Task.checkCancellation()
+
+                try await transaction.commit()
+
+                await transaction.close()
+
+                return result
+            } catch {
+                let operationError = error
+
+                do {
+                    try await transaction.rollback()
+                } catch {
+                    let rollbackError = error
+
+                    await transaction.close()
+
+                    throw PostgresTransactionError
+                        .rollbackFailed(
+                            operation: operationError.localizedDescription,
+                            rollback: rollbackError.localizedDescription
+                        )
+                }
+
+                await transaction.close()
+
+                throw operationError
+            }
+        }
     }
 
     /// Every declared database and whether it can be queried, in declaration order.
@@ -274,7 +284,7 @@ public actor PostgresConnector {
                         required: required,
                         state: .unreachable,
                         latencyMilliseconds: nil,
-                        detail: String(describing: error)
+                        detail: error.localizedDescription
                     )
                 )
             }
@@ -301,25 +311,25 @@ public actor PostgresConnector {
     }
 
     public func registeredDatabaseIdentifiers() -> [PostgresDatabaseIdentifier] {
-        return pools.keys.sorted {
+        return clients.keys.sorted {
             $0.rawValue < $1.rawValue
         }
     }
 
-    public func shutdown() {
-        for pool in pools.values {
-            try? pool.syncShutdownGracefully()
-        }
+    /// Closes every pool's connections, then the event loops if the connector created them.
+    public func shutdown() async {
+        runTask.cancel()
+        await runTask.value
 
         if ownsEventLoopGroup {
-            try? eventLoopGroup.syncShutdownGracefully()
+            try? await eventLoopGroup.shutdownGracefully()
         }
     }
 
-    private func pool(
+    private func client(
         for database: PostgresDatabaseIdentifier
-    ) throws -> EventLoopGroupConnectionPool<PostgresConnectionSource> {
-        guard let pool = pools[database] else {
+    ) throws -> PostgresClient {
+        guard let client = clients[database] else {
             if let state = states.first(where: { $0.id == database }),
                case .unavailable(let reason) = state.status
             {
@@ -327,14 +337,116 @@ public actor PostgresConnector {
             }
             throw PostgresConnectorError.databaseNotRegistered(database.rawValue)
         }
-        return pool
+        return client
+    }
+
+    /// Leases a connection, waiting at most `acquireTimeout` for one. The
+    /// timeout covers only the wait: once `body` has its connection it runs to
+    /// completion, so a write is never reported failed after it ran.
+    private func withConnection<Result: Sendable>(
+        on database: PostgresDatabaseIdentifier,
+        _ body: @escaping @Sendable (PostgresConnection) async throws -> Result
+    ) async throws -> Result {
+        let client = try self.client(for: database)
+        let id = database.rawValue
+        let timeout = options.acquireTimeout
+        let lease = NIOLockedValueBox(LeaseState.waiting)
+
+        return try await withThrowingTaskGroup(of: Result?.self) { group in
+            group.addTask {
+                do {
+                    return try await client.withConnection { connection in
+                        let claimed = lease.withLockedValue { state in
+                            guard state == .waiting else { return false }
+                            state = .leased
+                            return true
+                        }
+                        guard claimed else {
+                            throw CancellationError()
+                        }
+                        return try await body(connection)
+                    }
+                } catch where lease.withLockedValue({ $0 }) != .leased {
+                    if error is CancellationError || error is PostgresConnectorError {
+                        throw error
+                    }
+                    throw PostgresConnectorError.queryFailed(id: id, failure: .init(error))
+                }
+            }
+
+            group.addTask {
+                try await Task.sleep(for: timeout)
+
+                let expired = lease.withLockedValue { state in
+                    guard state == .waiting else { return false }
+                    state = .timedOut
+                    return true
+                }
+                guard expired else {
+                    return nil
+                }
+                throw PostgresConnectorError.connectionUnavailable(id: id, seconds: Self.seconds(timeout))
+            }
+
+            defer { group.cancelAll() }
+
+            while let value = try await group.next() {
+                if let value {
+                    return value
+                }
+            }
+            throw CancellationError()
+        }
+    }
+
+    /// Rethrows a query's failure as `PostgresConnectorError.queryFailed`,
+    /// whose description is safe to log (see `PostgresQueryFailure`).
+    static func reporting<Result>(
+        _ database: String,
+        isolation: isolated (any Actor)? = #isolation,
+        _ operation: () async throws -> Result
+    ) async throws -> Result {
+        do {
+            return try await operation()
+        } catch let error as PostgresConnectorError {
+            throw error
+        } catch let error as CancellationError {
+            throw error
+        } catch {
+            throw PostgresConnectorError.queryFailed(id: database, failure: .init(error))
+        }
+    }
+
+    private static func seconds(
+        _ duration: Duration
+    ) -> Double {
+        let components = duration.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+
+    private static func start(
+        _ clients: [PostgresDatabaseIdentifier: PostgresClient]
+    ) -> Task<Void, Never> {
+        let clients = Array(clients.values)
+
+        return Task {
+            await withTaskGroup(of: Void.self) { group in
+                for client in clients {
+                    group.addTask {
+                        await client.run()
+                    }
+                }
+            }
+        }
     }
 
     private static func build(
         declarations: [PostgresDatabaseDeclaration],
-        eventLoopGroup: any EventLoopGroup
+        eventLoopGroup: any EventLoopGroup,
+        options: PostgresPoolOptions,
+        logger: StandardLogger?
     ) throws -> (
-        pools: [PostgresDatabaseIdentifier: EventLoopGroupConnectionPool<PostgresConnectionSource>],
+        clients: [PostgresDatabaseIdentifier: PostgresClient],
         states: [PostgresDatabaseState]
     ) {
         var seen: Set<PostgresDatabaseIdentifier> = []
@@ -344,7 +456,7 @@ public actor PostgresConnector {
             }
         }
 
-        var pools: [PostgresDatabaseIdentifier: EventLoopGroupConnectionPool<PostgresConnectionSource>] = [:]
+        var clients: [PostgresDatabaseIdentifier: PostgresClient] = [:]
         var states: [PostgresDatabaseState] = []
         var missingRequired: [String] = []
 
@@ -357,11 +469,13 @@ public actor PostgresConnector {
                     )
                 }
 
-                let sqlConfiguration = try database.make.sql_configuration()
-
-                pools[declaration.id] = EventLoopGroupConnectionPool(
-                    source: PostgresConnectionSource(sqlConfiguration: sqlConfiguration),
-                    on: eventLoopGroup
+                clients[declaration.id] = PostgresClient(
+                    configuration: try database.make.client_configuration(options: options),
+                    eventLoopGroup: eventLoopGroup,
+                    backgroundLogger: PostgresStandardLogHandler.logger(
+                        database: declaration.id.rawValue,
+                        logger: logger
+                    )
                 )
                 states.append(
                     PostgresDatabaseState(id: declaration.id, requirement: declaration.requirement, status: .configured)
@@ -377,13 +491,17 @@ public actor PostgresConnector {
             }
         }
 
+        // Clients that never ran hold no connections; nothing to close.
         guard missingRequired.isEmpty else {
-            for pool in pools.values {
-                try? pool.syncShutdownGracefully()
-            }
             throw PostgresConnectorError.requiredDatabasesUnavailable(missingRequired)
         }
 
-        return (pools, states)
+        return (clients, states)
     }
+}
+
+private enum LeaseState: Sendable, Equatable {
+    case waiting
+    case leased
+    case timedOut
 }

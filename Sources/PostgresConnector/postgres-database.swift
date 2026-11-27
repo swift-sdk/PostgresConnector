@@ -1,7 +1,7 @@
 import Foundation
 import Milieu
 import NIOSSL
-import PostgresKit
+import PostgresNIO
 
 public struct PostgresDatabase: Sendable {
     public let id: PostgresDatabaseIdentifier
@@ -104,42 +104,52 @@ extension PostgresDatabase {
             self.postgresdatabase = postgresdatabase
         }
 
-        public static func ssl_context(
+        /// Loads the CA file once, so a missing or invalid one fails when the
+        /// connector is created rather than on the first query.
+        public static func tls_configuration(
             caFile: String,
             verification: CertificateVerification
-        ) throws -> NIOSSLContext {
+        ) throws -> TLSConfiguration {
             var tlsConfiguration = TLSConfiguration.makeClientConfiguration()
             tlsConfiguration.certificateVerification = verification
             tlsConfiguration.trustRoots = .file(caFile)
 
-            return try NIOSSLContext(configuration: tlsConfiguration)
+            _ = try NIOSSLContext(configuration: tlsConfiguration)
+
+            return tlsConfiguration
         }
 
-        public func sql_configuration() throws -> SQLPostgresConfiguration {
+        public func client_configuration(
+            options: PostgresPoolOptions
+        ) throws -> PostgresClient.Configuration {
+            let tls: PostgresClient.Configuration.TLS
             if let caFile = postgresdatabase.tls.caFile {
-                let sslContext = try Self.ssl_context(
-                    caFile: caFile,
-                    verification: postgresdatabase.tls.verification
+                tls = .require(
+                    try Self.tls_configuration(
+                        caFile: caFile,
+                        verification: postgresdatabase.tls.verification
+                    )
                 )
-
-                return SQLPostgresConfiguration(
-                    hostname: postgresdatabase.host,
-                    port: postgresdatabase.port,
-                    username: postgresdatabase.username,
-                    password: postgresdatabase.password,
-                    database: postgresdatabase.database,
-                    tls: .require(sslContext)
-                )
+            } else {
+                tls = .disable
             }
 
-            return SQLPostgresConfiguration(
-                hostname: postgresdatabase.host,
+            var configuration = PostgresClient.Configuration(
+                host: postgresdatabase.host,
                 port: postgresdatabase.port,
                 username: postgresdatabase.username,
                 password: postgresdatabase.password,
                 database: postgresdatabase.database,
-                tls: .disable
+                tls: tls
             )
+            configuration.options.maximumConnections = options.maximumConnections
+            configuration.options.connectionIdleTimeout = options.idleTimeout
+            configuration.options.connectTimeout = options.connectTimeout
+            configuration.options.keepAliveBehavior = options.keepAliveFrequency.map {
+                .init(frequency: $0)
+            }
+
+            return configuration
         }
     }
 }

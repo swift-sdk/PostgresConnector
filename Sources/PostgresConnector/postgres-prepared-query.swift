@@ -1,5 +1,5 @@
 import Foundation
-import PostgresKit
+import PostgresNIO
 import PSQL
 
 public struct PostgresPreparedQuery: Sendable {
